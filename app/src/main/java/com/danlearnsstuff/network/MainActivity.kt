@@ -8,6 +8,7 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Message
+import android.util.Log
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
@@ -41,6 +42,15 @@ class MainActivity : AppCompatActivity(), AudioController {
 
     /** True once the share page has loaded at least once (see onResume). */
     private var pageLoaded = false
+
+    /**
+     * v0.2.2 — per-resume reload guard: true once this resume event has
+     * already triggered a reload, whether through the direct
+     * `__dlsnResumeCheck` path or the `dlsn-requestRefresh` relay path.
+     * Reset at the top of every [onResume]; at most one reload per
+     * resume event, so a late relay message can never double-reload.
+     */
+    private var resumeReloadDone = false
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -87,6 +97,12 @@ class MainActivity : AppCompatActivity(), AudioController {
                 // ITEM 1 — hide the Muse share page's own header. Runs in
                 // the share page's top frame; never touches the app iframe.
                 view.evaluateJavascript(HEADER_HIDE_JS, null)
+                // v0.2.2 — postMessage relay: the app iframe posts bridge
+                // requests to this top frame (the bridge is injected here
+                // only), the relay calls the bridge, and results are
+                // posted back into the iframe. Without it, a cross-origin
+                // iframe can never reach DLSNBridge at all.
+                view.evaluateJavascript(RELAY_JS, null)
             }
 
             override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
@@ -150,6 +166,9 @@ class MainActivity : AppCompatActivity(), AudioController {
     override fun onResume() {
         super.onResume()
         webView.onResume()
+        // v0.2.2 — reset the per-resume reload guard (see
+        // requestRefreshFromRelay): at most one reload per resume event.
+        resumeReloadDone = false
         // ITEM 2 — refresh on resume, but only when all three hold:
         // (a) the page has loaded at least once, so this never reloads on
         // first launch; (b) nothing is playing; (c) the page itself says
@@ -160,7 +179,36 @@ class MainActivity : AppCompatActivity(), AudioController {
         webView.evaluateJavascript(
             "window.__dlsnResumeCheck ? window.__dlsnResumeCheck() : false"
         ) { result ->
-            if (result == "true") webView.reload()
+            if (result == "true") {
+                resumeReloadDone = true
+                webView.reload()
+            }
+        }
+    }
+
+    /**
+     * v0.2.2 — relay path for the resume check. Called by
+     * [AudioBridge.requestRefresh] when the top-frame relay receives a
+     * `dlsn-requestRefresh` postMessage from the app iframe. The iframe
+     * only posts it when the document becomes visible again AND its own
+     * triple guard holds (My Shows list visible, no series open,
+     * nothing playing — the same `__dlsnResumeCheck` conditions), so
+     * this is the cross-origin equivalent of the direct
+     * `__dlsnResumeCheck` evaluateJavascript path in [onResume], which
+     * is kept as the same-origin fallback. Performs the same reload,
+     * under the same native guards (page loaded, nothing playing) and
+     * the same per-resume guard: if this resume event already reloaded
+     * (either path), this is a no-op.
+     */
+    fun requestRefreshFromRelay() {
+        runOnUiThread {
+            if (isDestroyed) return@runOnUiThread
+            if (!pageLoaded) return@runOnUiThread
+            if (PlaybackStateBus.last?.playing == true) return@runOnUiThread
+            if (resumeReloadDone) return@runOnUiThread
+            resumeReloadDone = true
+            Log.d("DLSN", "resume refresh via relay")
+            webView.reload()
         }
     }
 
@@ -339,6 +387,182 @@ class MainActivity : AppCompatActivity(), AudioController {
               hideShareHeader();
               new MutationObserver(hideShareHeader).observe(document.documentElement, {
                 childList: true, subtree: true
+              });
+            })();
+        """.trimIndent()
+
+        /**
+         * v0.2.2 — postMessage relay between the app iframe and the native
+         * bridge. The native `DLSNBridge` JavascriptInterface is injected
+         * only into the share page's TOP frame, while the app lives in the
+         * artifact iframe; when that iframe is cross-origin,
+         * `window.parent.DLSNBridge` throws from inside it, so the native
+         * fetch is never called and the direct-fetch fallback fails as it
+         * always has. The relay closes that gap:
+         *
+         * Iframe -> top frame (window.postMessage to window.parent):
+         *   {type:'dlsn-fetchFeed', url, user, pass, requestId}
+         *   {type:'dlsn-openLink', url}
+         *   {type:'dlsn-downloadEpisode', url, key, title}
+         *   {type:'dlsn-isDownloaded', key, requestId}
+         *   {type:'dlsn-deleteDownload', key, requestId}
+         *   {type:'dlsn-state', playing, positionMs, durationMs,
+         *    title, artist, artwork}
+         *   {type:'dlsn-requestRefresh'}  (no fields — see below)
+         *
+         * `dlsn-requestRefresh` is the cross-origin half of the v0.2.0
+         * "refresh on menu open" behaviour: the direct
+         * `window.__dlsnResumeCheck()` evaluateJavascript in onResume
+         * runs in the top frame, where that function does not exist
+         * when the artifact iframe is cross-origin, so the check
+         * silently never fires. The iframe instead posts this message
+         * when it becomes visible again and its own triple guard holds
+         * (My Shows list visible, no series open, nothing playing —
+         * the same conditions `__dlsnResumeCheck` tests). Native
+         * reloads once per resume event at most (per-resume flag in
+         * MainActivity, reset on each onResume) and re-checks that
+         * nothing is playing before reloading. No reply message.
+         * The direct `__dlsnResumeCheck` path is kept as the
+         * same-origin fallback.
+         *
+         * Top frame -> iframe (iframe.contentWindow.postMessage):
+         *   {type:'dlsn-feedResult', requestId, ok, payload}
+         *   {type:'dlsn-downloadResult', key, ok, payload}
+         *   {type:'dlsn-isDownloadedResult', key, requestId, downloaded}
+         *   {type:'dlsn-deleteDownloadResult', key, requestId, ok}
+         *
+         * Origin is validated loosely: the message must come from this
+         * page's own origin, or from one of its iframes (event.source
+         * match). The request shape is validated too; anything else is
+         * ignored. Credentials in dlsn-fetchFeed are passed straight
+         * through to the native fetch (Basic auth) and are never logged
+         * or stored natively.
+         *
+         * The relay is additive: the direct `DLSNBridge`
+         * JavascriptInterface and the direct `window.__dlsn*` callbacks
+         * keep working as the same-origin fallback. Replies always go
+         * back through the channel the request arrived on — postMessage
+         * requests get postMessage replies; direct bridge calls keep
+         * their existing `__dlsn*` callbacks.
+         *
+         * Diagnostics: every relay request received and every reply
+         * posted is logged via bridge.relayLog (logcat tag `DLSN`).
+         */
+        val RELAY_JS: String = """
+            (function () {
+              if (window.__dlsnRelayInstalled) return;
+              window.__dlsnRelayInstalled = true;
+              var bridge = window.DLSNBridge;
+
+              function logRelay(direction, type, id) {
+                try {
+                  if (bridge && bridge.relayLog) bridge.relayLog(direction, type, id || '');
+                } catch (e) {}
+              }
+
+              // The app iframe: the largest visible iframe on the share
+              // page (the artifact frame). Falls back to the first iframe.
+              function appFrame() {
+                var frames = document.querySelectorAll('iframe');
+                var best = null, bestArea = 0;
+                for (var i = 0; i < frames.length; i++) {
+                  var r = frames[i].getBoundingClientRect();
+                  var area = r.width * r.height;
+                  if (area > bestArea) { bestArea = area; best = frames[i]; }
+                }
+                return best || frames[0] || null;
+              }
+
+              function postToApp(msg) {
+                var f = appFrame();
+                if (!f || !f.contentWindow) return false;
+                try {
+                  f.contentWindow.postMessage(msg, '*');
+                  logRelay('out', msg.type, msg.requestId || msg.key || '');
+                  return true;
+                } catch (e) { return false; }
+              }
+
+              // Native -> iframe: called by Kotlin (AudioBridge /
+              // DownloadHelper) via evaluateJavascript when a relayed
+              // request completes. Replies always go back through
+              // postMessage, never through a direct callback.
+              window.__dlsnRelayReply = function (kind, id, ok, payload) {
+                var msg;
+                if (kind === 'download') {
+                  msg = { type: 'dlsn-downloadResult', key: id, ok: !!ok, payload: payload };
+                } else {
+                  msg = { type: 'dlsn-feedResult', requestId: id, ok: !!ok, payload: payload };
+                }
+                postToApp(msg);
+              };
+
+              function originOk(ev) {
+                try {
+                  if (ev.origin === window.location.origin) return true;
+                  var frames = document.querySelectorAll('iframe');
+                  for (var i = 0; i < frames.length; i++) {
+                    if (frames[i].contentWindow === ev.source) return true;
+                  }
+                } catch (e) {}
+                return false;
+              }
+
+              window.addEventListener('message', function (ev) {
+                var d = ev.data;
+                if (!d || typeof d !== 'object' || typeof d.type !== 'string') return;
+                if (!originOk(ev)) return;
+                if (!bridge) return;
+                logRelay('in', d.type, d.requestId || d.key || '');
+                try {
+                  switch (d.type) {
+                    case 'dlsn-fetchFeed':
+                      // user/pass pass straight through to the native
+                      // fetch (Basic auth); never logged, never stored.
+                      if (typeof d.url === 'string' && typeof d.requestId === 'string') {
+                        bridge.fetchFeedRelay(d.url, d.user || '', d.pass || '', d.requestId);
+                      }
+                      break;
+                    case 'dlsn-openLink':
+                      if (typeof d.url === 'string') bridge.openLink(d.url);
+                      break;
+                    case 'dlsn-downloadEpisode':
+                      if (typeof d.url === 'string' && typeof d.key === 'string') {
+                        bridge.downloadEpisodeRelay(d.url, d.key, d.title || '');
+                      }
+                      break;
+                    case 'dlsn-isDownloaded':
+                      if (typeof d.key === 'string' && typeof d.requestId === 'string') {
+                        var downloaded = false;
+                        try { downloaded = !!bridge.isDownloaded(d.key); } catch (e) {}
+                        postToApp({ type: 'dlsn-isDownloadedResult', key: d.key, requestId: d.requestId, downloaded: downloaded });
+                      }
+                      break;
+                    case 'dlsn-deleteDownload':
+                      if (typeof d.key === 'string' && typeof d.requestId === 'string') {
+                        try { bridge.deleteDownload(d.key); } catch (e) {}
+                        postToApp({ type: 'dlsn-deleteDownloadResult', key: d.key, requestId: d.requestId, ok: true });
+                      }
+                      break;
+                    case 'dlsn-state':
+                      if (typeof d.playing === 'boolean') {
+                        bridge.onState(!!d.playing, d.positionMs | 0, d.durationMs | 0,
+                          d.title || '', d.artist || '', d.artwork || '');
+                      }
+                      break;
+                    case 'dlsn-requestRefresh':
+                      // v0.2.2 — the iframe's visibilitychange listener
+                      // fires this when the app becomes visible again and
+                      // the triple guard holds (My Shows list visible, no
+                      // series open, nothing playing). Same reload the
+                      // direct __dlsnResumeCheck path performs; the
+                      // per-resume guard in Kotlin keeps it to one reload
+                      // per resume event, and native re-checks that
+                      // nothing is playing first. No fields, no reply.
+                      bridge.requestRefresh();
+                      break;
+                  }
+                } catch (e) {}
               });
             })();
         """.trimIndent()

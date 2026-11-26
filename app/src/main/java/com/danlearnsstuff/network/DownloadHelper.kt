@@ -8,6 +8,7 @@ import android.content.IntentFilter
 import android.database.Cursor
 import android.net.Uri
 import android.os.Environment
+import android.util.Log
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import org.json.JSONObject
@@ -32,8 +33,11 @@ class DownloadHelper(private val activity: MainActivity) {
     private val downloadManager =
         activity.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
 
-    /** DownloadManager id -> sanitised episode key, for in-flight downloads. */
-    private val pending = mutableMapOf<Long, String>()
+    /** DownloadManager id -> sanitised episode key + relay channel, for in-flight downloads. */
+    private val pending = mutableMapOf<Long, PendingDownload>()
+
+    /** v0.2.2 — which channel the completion result must go back on. */
+    private data class PendingDownload(val key: String, val viaRelay: Boolean)
 
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -81,7 +85,13 @@ class DownloadHelper(private val activity: MainActivity) {
         return file.exists() && file.delete()
     }
 
-    fun enqueue(url: String, key: String, title: String) {
+    /**
+     * Enqueue a download. `viaRelay` (v0.2.2) routes the completion
+     * callback through the top-frame postMessage relay instead of the
+     * direct `window.__dlsnDownloadResult` callback — it must match the
+     * channel the request arrived on.
+     */
+    fun enqueue(url: String, key: String, title: String, viaRelay: Boolean = false) {
         val safeKey = sanitizeKey(key)
         val request = DownloadManager.Request(Uri.parse(url))
             .setTitle(title)
@@ -92,12 +102,13 @@ class DownloadHelper(private val activity: MainActivity) {
             )
             .addRequestHeader("User-Agent", AudioBridge.DESKTOP_USER_AGENT)
         val id = downloadManager.enqueue(request)
-        synchronized(pending) { pending[id] = safeKey }
+        synchronized(pending) { pending[id] = PendingDownload(safeKey, viaRelay) }
         register()
     }
 
     private fun onDownloadComplete(id: Long) {
-        val key: String = synchronized(pending) { pending.remove(id) } ?: return
+        val download: PendingDownload = synchronized(pending) { pending.remove(id) } ?: return
+        val key = download.key
         val file = fileFor(key)
         var success = false
         var error = "Download failed"
@@ -120,17 +131,24 @@ class DownloadHelper(private val activity: MainActivity) {
             val uri = FileProvider.getUriForFile(
                 activity, "${activity.packageName}.fileprovider", file
             )
-            reportResult(key, true, uri.toString())
+            reportResult(key, true, uri.toString(), download.viaRelay)
         } else {
-            reportResult(key, false, error)
+            reportResult(key, false, error, download.viaRelay)
         }
     }
 
-    private fun reportResult(key: String, ok: Boolean, payload: String) {
-        activity.evalJs(
+    private fun reportResult(key: String, ok: Boolean, payload: String, viaRelay: Boolean) {
+        Log.d(AudioBridge.TAG, "downloadResult key=$key ok=$ok viaRelay=$viaRelay")
+        val js = if (viaRelay) {
+            // Post back through the relay, which forwards into the iframe.
+            "window.__dlsnRelayReply && window.__dlsnRelayReply(" +
+                JSONObject.quote("download") + "," + JSONObject.quote(key) + "," + ok + "," +
+                JSONObject.quote(payload) + ")"
+        } else {
             "window.__dlsnDownloadResult(" +
                 JSONObject.quote(key) + "," + ok + "," + JSONObject.quote(payload) + ")"
-        )
+        }
+        activity.evalJs(js)
     }
 
     companion object {

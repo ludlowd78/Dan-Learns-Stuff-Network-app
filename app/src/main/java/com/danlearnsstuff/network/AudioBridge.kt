@@ -2,12 +2,17 @@ package com.danlearnsstuff.network
 
 import android.content.Intent
 import android.util.Base64
+import android.util.Log
 import android.webkit.JavascriptInterface
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.io.IOException
+import java.io.StringReader
 import java.net.HttpURLConnection
 import java.net.URL
+import org.xmlpull.v1.XmlPullParser
+import org.xmlpull.v1.XmlPullParserFactory
 
 /**
  * Bridge between the web player's `<audio>` element and the native side.
@@ -28,7 +33,24 @@ import java.net.URL
  * [fetchFeed] (fetch a podcast RSS feed outside the browser, so imported
  * podcasts can load episodes), [openLink] (open a URL in the external
  * browser), and [downloadEpisode]/[isDownloaded]/[deleteDownload]
- * (per-episode offline downloads).
+ * (per-episode offline downloads). [requestRefresh] is the relay entry
+ * point for the v0.2.0 resume check: the iframe posts
+ * `dlsn-requestRefresh` when it becomes visible again with the triple
+ * guard holding, and native reloads once per resume event at most.
+ *
+ * v0.2.2 — the bridge is injected only into the share page's TOP frame,
+ * while the app lives in the artifact iframe. When that iframe is
+ * cross-origin, `window.parent.DLSNBridge` throws from inside the iframe
+ * and none of the methods above is ever reached. The fix is a postMessage
+ * relay (RELAY_JS in MainActivity): the iframe posts requests to the top
+ * frame, the relay calls the bridge methods there, and results are posted
+ * back into the iframe. Relay entry points are [fetchFeedRelay],
+ * [downloadEpisodeRelay] and [requestRefresh]; [onState], [openLink],
+ * [isDownloaded] and [deleteDownload] are called by the relay directly.
+ * The direct JavascriptInterface methods stay as the same-origin fallback.
+ * Feed results are now compact episode JSON parsed natively (see
+ * [parseFeedToCompactJson]), not raw XML — the web side must JSON.parse
+ * the payload.
  */
 class AudioBridge(private val activity: MainActivity) {
 
@@ -74,13 +96,38 @@ class AudioBridge(private val activity: MainActivity) {
      * browser, so imported podcasts can load episodes (in-page fetches
      * fail from the share-page frame). Runs on a background thread and
      * reports back via `window.__dlsnFeedResult(requestId, ok, payload)`:
-     * on success `ok` is true and `payload` is the feed body as UTF-8
-     * text (capped at ~2 MB); on failure `ok` is false and `payload` is
-     * the error message. `requestId` is echoed so the page can match the
-     * result to its request.
+     * on success `ok` is true and `payload` is compact episode JSON (see
+     * [parseFeedToCompactJson]); on failure `ok` is false and `payload`
+     * is the error message. `requestId` is echoed so the page can match
+     * the result to its request. `user`/`pass` are sent as Basic auth
+     * when non-empty (paid feeds, e.g. Never Not Funny) — they are passed
+     * through only, never logged and never stored.
      */
     @JavascriptInterface
     fun fetchFeed(url: String, user: String, pass: String, requestId: String) {
+        fetchFeedInternal(url, user, pass, requestId, viaRelay = false)
+    }
+
+    /**
+     * v0.2.2 — relay entry point for [fetchFeed]: identical fetch, but
+     * the result is delivered through the top-frame postMessage relay
+     * (`window.__dlsnRelayReply`) instead of the direct
+     * `window.__dlsnFeedResult` callback, so it reaches the app even
+     * when the artifact iframe is cross-origin with the share page.
+     * Called by the relay JS in MainActivity, never directly by the web
+     * app. Covers both feed paths — opening an imported show AND the
+     * add-form validation (including paid feeds with user/pass).
+     */
+    @JavascriptInterface
+    fun fetchFeedRelay(url: String, user: String, pass: String, requestId: String) {
+        fetchFeedInternal(url, user, pass, requestId, viaRelay = true)
+    }
+
+    private fun fetchFeedInternal(
+        url: String, user: String, pass: String, requestId: String, viaRelay: Boolean
+    ) {
+        // Credentials are passed through to Basic auth only — never logged.
+        Log.d(TAG, "fetchFeed url=$url requestId=$requestId viaRelay=$viaRelay")
         Thread {
             try {
                 val connection = URL(url).openConnection() as HttpURLConnection
@@ -114,22 +161,156 @@ class AudioBridge(private val activity: MainActivity) {
                         }
                     }
                     val text = out.toString(Charsets.UTF_8.name())
-                    reportFeedResult(requestId, true, text)
+                    // v0.2.2 — parse natively and return compact JSON, never
+                    // the raw XML (which ran near the ~1 MB binder limit).
+                    val compactJson = parseFeedToCompactJson(text)
+                    reportFeedResult(requestId, true, compactJson, viaRelay)
                 } finally {
                     connection.disconnect()
                 }
             } catch (e: Exception) {
-                reportFeedResult(requestId, false, e.message ?: e.toString())
+                reportFeedResult(requestId, false, e.message ?: e.toString(), viaRelay)
             }
         }.start()
     }
 
-    private fun reportFeedResult(requestId: String, ok: Boolean, payload: String) {
-        activity.evalJs(
+    private fun reportFeedResult(requestId: String, ok: Boolean, payload: String, viaRelay: Boolean) {
+        Log.d(TAG, "reportFeedResult requestId=$requestId ok=$ok payloadBytes=${payload.length} viaRelay=$viaRelay")
+        val js = if (viaRelay) {
+            // Post back through the relay, which forwards into the iframe.
+            "window.__dlsnRelayReply && window.__dlsnRelayReply(" +
+                JSONObject.quote("feed") + "," + JSONObject.quote(requestId) + "," + ok + "," +
+                JSONObject.quote(payload) + ")"
+        } else {
             "window.__dlsnFeedResult(" +
                 JSONObject.quote(requestId) + "," + ok + "," +
                 JSONObject.quote(payload) + ")"
-        )
+        }
+        activity.evalJs(js)
+    }
+
+    /**
+     * v0.2.2 — parse RSS 2.0 / Atom natively (Android's built-in
+     * XmlPullParser, no new dependencies) and return compact episode
+     * JSON the web side parses instead of raw XML:
+     *
+     * `{"feedTitle": "...", "feedDescription": "...",
+     *   "episodes": [{"title": "...", "audioUrl": "...",
+     *   "pubDate": "...", "duration": "...", "guid": "..."}]}`
+     *
+     * Only the first [MAX_EPISODES] episodes are kept (feeds list
+     * newest first) and the payload is shrunk to under
+     * [MAX_FEED_JSON_CHARS], so the result is a few KB at most — never
+     * the ~951 KB of raw XML that used to travel through
+     * evaluateJavascript. `duration` is the raw `itunes:duration` string
+     * (e.g. "1:23:45"); empty when the feed has none. `pubDate` is the
+     * raw `pubDate` / `published` string. Throws on malformed XML, which
+     * the caller reports as a fetch failure.
+     */
+    private fun parseFeedToCompactJson(xml: String): String {
+        val factory = XmlPullParserFactory.newInstance()
+        factory.isNamespaceAware = true
+        val parser = factory.newPullParser()
+        parser.setInput(StringReader(xml))
+        var feedTitle = ""
+        var feedDescription = ""
+        val episodes = ArrayList<JSONObject>()
+        var inEpisode = false
+        var isAtomEntry = false
+        var itemTitle = ""
+        var itemAudio = ""
+        var itemDate = ""
+        var itemDuration = ""
+        var itemGuid = ""
+        var textField: String? = null
+        var eventType = parser.eventType
+        while (eventType != XmlPullParser.END_DOCUMENT) {
+            when (eventType) {
+                XmlPullParser.START_TAG -> {
+                    val name = parser.name ?: ""
+                    when {
+                        name == "item" -> {
+                            inEpisode = true; isAtomEntry = false
+                            itemTitle = ""; itemAudio = ""; itemDate = ""
+                            itemDuration = ""; itemGuid = ""
+                            textField = null
+                        }
+                        name == "entry" -> {
+                            inEpisode = true; isAtomEntry = true
+                            itemTitle = ""; itemAudio = ""; itemDate = ""
+                            itemDuration = ""; itemGuid = ""
+                            textField = null
+                        }
+                        name == "enclosure" && inEpisode -> {
+                            val u = parser.getAttributeValue(null, "url")
+                            if (!u.isNullOrEmpty() && itemAudio.isEmpty()) itemAudio = u
+                        }
+                        name == "link" && inEpisode && isAtomEntry -> {
+                            val rel = parser.getAttributeValue(null, "rel")
+                            val href = parser.getAttributeValue(null, "href")
+                            if (!href.isNullOrEmpty() &&
+                                (rel == "enclosure" ||
+                                    (itemAudio.isEmpty() && href.endsWith(".mp3", ignoreCase = true)))
+                            ) itemAudio = href
+                        }
+                        name == "title" -> textField = if (inEpisode) "title" else "feedTitle"
+                        name == "description" && !inEpisode -> textField = "feedDescription"
+                        name == "subtitle" && !inEpisode -> textField = "feedDescription"
+                        name == "pubDate" && inEpisode -> textField = "pubDate"
+                        name == "published" && inEpisode -> textField = "pubDate"
+                        name == "updated" && inEpisode -> textField = "updated"
+                        name == "duration" && inEpisode -> textField = "duration"
+                        name == "guid" && inEpisode -> textField = "guid"
+                        name == "id" && inEpisode && isAtomEntry -> textField = "guid"
+                        else -> textField = null
+                    }
+                }
+                XmlPullParser.TEXT -> {
+                    val t = parser.text
+                    if (!t.isNullOrEmpty()) {
+                        when (textField) {
+                            "title" -> itemTitle += t
+                            "feedTitle" -> feedTitle += t
+                            "feedDescription" -> feedDescription += t
+                            "pubDate" -> itemDate += t
+                            "updated" -> if (itemDate.isEmpty()) itemDate += t
+                            "duration" -> itemDuration += t
+                            "guid" -> itemGuid += t
+                        }
+                    }
+                }
+                XmlPullParser.END_TAG -> {
+                    val name = parser.name ?: ""
+                    if ((name == "item" || name == "entry") && inEpisode) {
+                        if (itemTitle.isNotEmpty() || itemAudio.isNotEmpty()) {
+                            episodes.add(JSONObject().apply {
+                                put("title", itemTitle.trim().take(300))
+                                put("audioUrl", itemAudio.trim().take(2000))
+                                put("pubDate", itemDate.trim().take(100))
+                                put("duration", itemDuration.trim().take(20))
+                                put("guid", itemGuid.trim().take(500))
+                            })
+                        }
+                        inEpisode = false
+                        isAtomEntry = false
+                    }
+                    textField = null
+                }
+            }
+            eventType = parser.next()
+        }
+        val root = JSONObject()
+        root.put("feedTitle", feedTitle.trim().take(300))
+        root.put("feedDescription", feedDescription.trim().take(1000))
+        val arr = JSONArray()
+        for (ep in episodes.take(MAX_EPISODES)) arr.put(ep)
+        root.put("episodes", arr)
+        var json = root.toString()
+        while (json.length > MAX_FEED_JSON_CHARS && arr.length() > 0) {
+            arr.remove(arr.length() - 1)
+            json = root.toString()
+        }
+        return json
     }
 
     /**
@@ -153,6 +334,56 @@ class AudioBridge(private val activity: MainActivity) {
         }
     }
 
+    /**
+     * v0.2.2 — relay entry point for [downloadEpisode]: identical
+     * download, but completion is reported through the top-frame
+     * postMessage relay (`window.__dlsnRelayReply`) instead of the
+     * direct `window.__dlsnDownloadResult` callback. Called by the
+     * relay JS in MainActivity, never directly by the web app.
+     */
+    @JavascriptInterface
+    fun downloadEpisodeRelay(url: String, key: String, title: String) {
+        try {
+            activity.downloadHelper.enqueue(url, key, title, viaRelay = true)
+        } catch (e: Exception) {
+            activity.evalJs(
+                "window.__dlsnRelayReply && window.__dlsnRelayReply(" +
+                    JSONObject.quote("download") + "," + JSONObject.quote(key) +
+                    ",false," + JSONObject.quote(e.message ?: "Download failed") + ")"
+            )
+        }
+    }
+
+    /**
+     * v0.2.2 — relay entry point for the resume check. Called by the
+     * top-frame relay JS when the iframe posts
+     * `{type:'dlsn-requestRefresh'}`. The iframe only posts it when the
+     * document becomes visible again AND the triple guard holds (My
+     * Shows list visible, no series open, nothing playing — the same
+     * conditions `__dlsnResumeCheck` tests), so this never fires on
+     * initial page load and never interrupts playback. The actual reload
+     * and the once-per-resume guard live in
+     * [MainActivity.requestRefreshFromRelay]; this method just forwards.
+     * No reply message — the reload itself is the response.
+     */
+    @JavascriptInterface
+    fun requestRefresh() {
+        activity.requestRefreshFromRelay()
+    }
+
+    /**
+     * v0.2.2 — called by the top-frame relay JS so relay traffic shows
+     * in logcat (tag `DLSN`): `direction` is "in" (a postMessage request
+     * arrived from the iframe) or "out" (a reply was posted into the
+     * iframe), `type` is the message type, `id` the requestId/key.
+     * This is what makes "bridge never called" vs "callback lost"
+     * distinguishable next time.
+     */
+    @JavascriptInterface
+    fun relayLog(direction: String, type: String, id: String) {
+        Log.d(TAG, "relay $direction type=$type id=$id")
+    }
+
     /** ITEM 7 — true when the episode file for [key] is already downloaded. */
     @JavascriptInterface
     fun isDownloaded(key: String): Boolean {
@@ -174,6 +405,9 @@ class AudioBridge(private val activity: MainActivity) {
     }
 
     companion object {
+        /** Logcat tag for all bridge diagnostics (v0.2.2). */
+        const val TAG = "DLSN"
+
         /** Desktop-ish User-Agent for native fetches/downloads. */
         const val DESKTOP_USER_AGENT =
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 " +
@@ -181,6 +415,12 @@ class AudioBridge(private val activity: MainActivity) {
 
         /** Feed bodies are capped at ~2 MB. */
         const val MAX_FEED_BYTES = 2 * 1024 * 1024
+
+        /** v0.2.2 — at most this many episodes in the compact feed JSON. */
+        const val MAX_EPISODES = 200
+
+        /** v0.2.2 — compact feed JSON is shrunk to stay under this many chars. */
+        const val MAX_FEED_JSON_CHARS = 180_000
 
         val INJECTED_JS: String = """
             (function () {
