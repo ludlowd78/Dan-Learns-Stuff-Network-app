@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Dan Learns Stuff Network</string>
+    <!-- The published version of the network web app. New episodes appear
+         here whenever the app is shared again from Muse. -->
+    <string name="app_url">https://muse.ai/s/through-the-doorway-xtxg6xsxzvxoxixsfz/-W1Tc5tyUDwt2LBnvlzIf1H36NTNSy0hAyYryBQZWFs</string>
+</resources>
