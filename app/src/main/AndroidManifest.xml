@@ -30,6 +30,19 @@
             android:exported="false"
             android:foregroundServiceType="mediaPlayback" />
 
+        <!-- Lets the web app play downloaded episodes via the content://
+             URI returned by DownloadHelper (see res/xml/file_paths.xml).
+             App-specific external storage only; no storage permission. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+
     </application>
 
 </manifest>

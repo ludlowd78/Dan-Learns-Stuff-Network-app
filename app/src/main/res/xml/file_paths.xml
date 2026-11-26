@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- FileProvider paths for downloaded episodes. The "dlsn_music" path is
+     the app-specific external Music/dlsn/ directory used by DownloadHelper
+     (getExternalFilesDir(Environment.DIRECTORY_MUSIC)/dlsn). -->
+<paths>
+    <external-files-path name="dlsn_music" path="Music/dlsn/" />
+</paths>
